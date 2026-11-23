@@ -24,6 +24,71 @@ const LUKA = {
 
 const W = 840, H = 240, TREE_LINE = 176, PAW = 206, DAYS = 30;
 
+async function gql(token, query, variables = {}) {
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: { Authorization: `bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (json.errors || !json.data) throw new Error(JSON.stringify(json.errors || json));
+  return json.data;
+}
+
+// Calendar date (YYYY-MM-DD) in your timezone, so "today" matches your clock.
+const TZ = process.env.LUKA_TZ || "UTC";
+const dayKey = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date(d));
+
+// GitHub's contribution graph, which can miss private-repo commits.
+async function calendarCounts(token, login) {
+  const data = await gql(token, `query($login:String!){user(login:$login){contributionsCollection{
+    contributionCalendar{weeks{contributionDays{date contributionCount}}}}}}`, { login });
+  const map = new Map();
+  for (const w of data.user.contributionsCollection.contributionCalendar.weeks)
+    for (const d of w.contributionDays) map.set(d.date, d.contributionCount);
+  return map;
+}
+
+// Counts your commits directly on the main branch of every repo the token can read,
+// private ones included. Needs a GH_PAT with read access to your repos; with the
+// built-in Actions token this returns null and we fall back to the graph.
+async function directCommitCounts(token, since) {
+  let viewer;
+  try {
+    viewer = (await gql(token, `{viewer{id login}}`)).viewer;
+  } catch { return null; }
+  // The built-in Actions token isn't you, so it can't see your private repos.
+  if (viewer.login.toLowerCase() !== process.env.GH_USER.toLowerCase()) return null;
+  const repos = [];
+  let after = null;
+  do {
+    const data = await gql(token, `query($after:String){viewer{repositories(first:100, after:$after,
+      ownerAffiliations:[OWNER, COLLABORATOR, ORGANIZATION_MEMBER], orderBy:{field:PUSHED_AT, direction:DESC}){
+      pageInfo{hasNextPage endCursor} nodes{owner{login} name pushedAt isFork defaultBranchRef{name}}}}}`, { after });
+    const page = data.viewer.repositories;
+    for (const r of page.nodes) if (r.pushedAt >= since && r.defaultBranchRef) repos.push(r);
+    after = page.pageInfo.hasNextPage && page.nodes.at(-1)?.pushedAt >= since ? page.pageInfo.endCursor : null;
+  } while (after);
+
+  const counts = new Map();
+  for (const r of repos) {
+    let cursor = null;
+    do {
+      const data = await gql(token, `query($o:String!,$n:String!,$since:GitTimestamp!,$id:ID!,$cursor:String){
+        repository(owner:$o,name:$n){defaultBranchRef{target{... on Commit{
+          history(first:100, after:$cursor, since:$since, author:{id:$id}){
+            pageInfo{hasNextPage endCursor} nodes{authoredDate}}}}}}}`,
+        { o: r.owner.login, n: r.name, since, id: viewer.id, cursor });
+      const h = data.repository?.defaultBranchRef?.target?.history;
+      if (!h) break;
+      for (const c of h.nodes) { const k = dayKey(c.authoredDate); counts.set(k, (counts.get(k) || 0) + 1); }
+      cursor = h.pageInfo.hasNextPage ? h.pageInfo.endCursor : null;
+    } while (cursor);
+  }
+  console.log(`Counted commits directly across ${repos.length} repos`);
+  return counts;
+}
+
 async function fetchDays() {
   if (process.argv.includes("--mock")) {
     let seed = 7;
@@ -35,19 +100,23 @@ async function fetchDays() {
   }
   const { GH_TOKEN, GH_USER } = process.env;
   if (!GH_TOKEN || !GH_USER) throw new Error("Set GH_TOKEN and GH_USER (or pass --mock)");
-  const query = `query($login:String!){user(login:$login){contributionsCollection{
-    contributionCalendar{weeks{contributionDays{date contributionCount}}}}}}`;
-  const res = await fetch("https://api.github.com/graphql", {
-    method: "POST",
-    headers: { Authorization: `bearer ${GH_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables: { login: GH_USER } }),
-  });
-  const json = await res.json();
-  if (json.errors) throw new Error(JSON.stringify(json.errors));
-  return json.data.user.contributionsCollection.contributionCalendar.weeks
-    .flatMap((w) => w.contributionDays)
-    .map((d) => ({ date: d.date, count: d.contributionCount }))
-    .slice(-DAYS);
+
+  const keys = Array.from({ length: DAYS }, (_, i) => dayKey(Date.now() - (DAYS - 1 - i) * 86400000));
+  const since = new Date(Date.now() - (DAYS + 1) * 86400000).toISOString();
+  const calendar = await calendarCounts(GH_TOKEN, GH_USER);
+  const direct = await directCommitCounts(GH_TOKEN, since);
+  if (!direct) {
+    // Without repo access we'd only see GitHub's graph, which misses your private
+    // commits. Keep the last good scene instead of overwriting it with near-zero.
+    console.log("::warning::GH_PAT secret missing or lacks repo access. Keeping the current luka.svg.");
+    return null;
+  }
+  // Take the larger of the two per day: the graph also counts PRs/issues,
+  // the direct count catches private commits the graph misses.
+  return keys.map((date) => ({
+    date,
+    count: Math.max(calendar.get(date) || 0, direct?.get(date) || 0),
+  }));
 }
 
 // Deterministic pseudo-random so the scene doesn't jump around between runs.
@@ -208,6 +277,7 @@ function build(days) {
 }
 
 const days = await fetchDays();
+if (!days) process.exit(0);
 writeFileSync("luka.svg", build(days));
 if (process.argv.includes("--nap")) {
   writeFileSync("luka-nap.svg", build(days.map((d, i) => (i >= DAYS - 3 ? { ...d, count: 0 } : d))));

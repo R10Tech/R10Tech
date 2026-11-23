@@ -21,6 +21,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
           GH_USER: ${{ github.repository_owner }}
+          LUKA_TZ: America/Chicago
       - name: Commit if changed
         run: |
           git config user.name "luka-bot"
